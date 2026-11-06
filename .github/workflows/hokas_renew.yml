@@ -1,0 +1,90 @@
+name: Hokas Auto Renew
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每 6 小时自动运行一次（Hokas 每个续期选项冷却时间为 6 小时）
+    - cron: "15 */6 * * *"
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system dependencies & Google Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb curl jq unzip
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+            rm -f google-chrome-stable_current_amd64.deb
+          fi
+          google-chrome --version
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Setup optional VLESS node
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          if [ -n "$NODE_LINK" ]; then
+            echo "NODE_LINK detected. Downloading sing-box and starting local SOCKS5 proxy..."
+            SB_VER="1.10.7"
+            curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz" -o /tmp/sing-box.tar.gz
+            tar -xzf /tmp/sing-box.tar.gz -C /tmp
+            sudo mv "/tmp/sing-box-${SB_VER}-linux-amd64/sing-box" /usr/local/bin/sing-box
+            sudo chmod +x /usr/local/bin/sing-box
+            rm -rf /tmp/sing-box.tar.gz "/tmp/sing-box-${SB_VER}-linux-amd64"
+
+            python3 scripts/setup_proxy.py
+
+            if [ -f /tmp/singbox_config.json ]; then
+              echo "Checking proxy connectivity via socks5://127.0.0.1:1080..."
+              curl -sS --socks5-hostname 127.0.0.1:1080 https://api.ipify.org --max-time 15 || echo "Proxy IP check warning (continuing)"
+              echo ""
+            fi
+          else
+            echo "NODE_LINK is empty. Setting IS_PROXY=false (direct connection)."
+            echo "IS_PROXY=false" >> $GITHUB_ENV
+            echo "PROXY_URL=" >> $GITHUB_ENV
+          fi
+
+      - name: Run Hokas renewal script
+        env:
+          HOKAS_EMAIL: ${{ secrets.HOKAS_EMAIL }}
+          HOKAS_PASSWORD: ${{ secrets.HOKAS_PASSWORD }}
+          HOKAS_SERVER_URL: ${{ secrets.HOKAS_SERVER_URL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 scripts/hokas_renew.py
+
+      - name: Upload screenshots artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hokas-renew-screenshots-${{ github.run_number }}
+          path: screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Cleanup proxy
+        if: always()
+        run: |
+          echo "Stopping sing-box process and cleaning up proxy config files..."
+          sudo pkill -9 sing-box || true
+          rm -f /tmp/singbox_config.json /tmp/singbox.log
