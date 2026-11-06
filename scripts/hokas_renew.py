@@ -137,6 +137,42 @@ def create_browser() -> ChromiumPage:
     return page
 
 
+def find_clerk_continue_button(page: ChromiumPage):
+    """
+    Find the form submit 'Continue' button on Clerk sign-in page,
+    explicitly excluding 'Continue with Google' or other OAuth buttons.
+    """
+    return (
+        page.ele("css:button.cl-formButtonPrimary", timeout=3)
+        or page.ele(
+            "xpath://button[contains(., 'Continue') and not(contains(., 'Google')) and not(contains(., 'GitHub')) and not(contains(., 'Discord'))]",
+            timeout=5,
+        )
+        or page.ele('css:form button[type="submit"]', timeout=3)
+    )
+
+
+def is_element_really_visible(page: ChromiumPage, ele) -> bool:
+    if not ele:
+        return False
+    try:
+        return bool(
+            page.run_js(
+                """
+                const el = arguments[0];
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 10 && rect.height > 10;
+                """,
+                ele,
+            )
+        )
+    except Exception:
+        return False
+
+
 def login_hokas(page: ChromiumPage, email: str, password: str):
     """Step 0: Open https://hokas.net/sign-in, enter email & password, click Continue."""
     log(f"Navigating to login page: {SIGN_IN_URL}")
@@ -148,65 +184,68 @@ def login_hokas(page: ChromiumPage, email: str, password: str):
         page.ele('css:input[name="identifier"]', timeout=15)
         or page.ele('css:input[type="email"]', timeout=5)
         or page.ele('css:input[placeholder*="email" i]', timeout=5)
-        or page.ele("tag:input", timeout=5)
     )
     if not email_input:
+        save_screenshot(page, "ERROR_login_no_email_input")
         raise RuntimeError("登录页面未能找到邮箱输入框 (Email address input not found)")
 
     log("Entering email address...")
+    email_input.click()
     email_input.clear()
     email_input.input(email)
-    time.sleep(1)
+    time.sleep(1.5)
 
-    # Check if password input is already visible (as shown in 2026-11-05_21-41_1.png)
-    pwd_input = page.ele('css:input[type="password"]', timeout=3) or page.ele(
+    # Check if password input is already visible on screen
+    pwd_input = page.ele('css:input[type="password"]', timeout=2) or page.ele(
         'css:input[name="password"]', timeout=2
     )
-    if pwd_input and pwd_input.states.is_displayed:
-        log("Entering password...")
-        pwd_input.clear()
-        pwd_input.input(password)
-        time.sleep(1)
 
-        continue_btn = (
-            page.ele("xpath://button[contains(., 'Continue')]", timeout=5)
-            or page.ele('css:button[type="submit"]', timeout=5)
-        )
+    if not is_element_really_visible(page, pwd_input):
+        log("Password field not visible yet; clicking form Continue button after email...")
+        continue_btn = find_clerk_continue_button(page)
         if not continue_btn:
-            raise RuntimeError("登录页面未能找到 Continue 按钮")
-        log("Clicking Continue button to sign in...")
+            save_screenshot(page, "ERROR_login_no_continue_btn_step1")
+            raise RuntimeError("登录页面未能找到邮箱下方的 Continue 按钮")
         continue_btn.click()
-    else:
-        # Two-step Clerk flow fallback: click Continue after email, then enter password
-        continue_btn = (
-            page.ele("xpath://button[contains(., 'Continue')]", timeout=5)
-            or page.ele('css:button[type="submit"]', timeout=5)
-        )
-        if continue_btn:
-            continue_btn.click()
-            time.sleep(3)
-        pwd_input = page.ele('css:input[type="password"]', timeout=10)
-        if not pwd_input:
-            raise RuntimeError("未能找到密码输入框 (Password input not found)")
-        pwd_input.clear()
-        pwd_input.input(password)
-        time.sleep(1)
-        continue_btn = (
-            page.ele("xpath://button[contains(., 'Continue')]", timeout=5)
-            or page.ele('css:button[type="submit"]', timeout=5)
-        )
-        if continue_btn:
-            continue_btn.click()
 
-    # Wait for login redirect away from /sign-in
-    for _ in range(25):
+        # Wait for password field to appear
+        for _ in range(15):
+            time.sleep(1)
+            pwd_input = page.ele('css:input[type="password"]', timeout=1) or page.ele(
+                'css:input[name="password"]', timeout=1
+            )
+            if is_element_really_visible(page, pwd_input):
+                break
+
+    if not is_element_really_visible(page, pwd_input):
+        save_screenshot(page, "ERROR_login_no_password_input")
+        raise RuntimeError(f"点击 Continue 后未能看到密码输入框，当前 URL: {page.url}")
+
+    log("Entering password...")
+    pwd_input.click()
+    pwd_input.clear()
+    pwd_input.input(password)
+    time.sleep(1.5)
+
+    continue_btn = find_clerk_continue_button(page)
+    if not continue_btn:
+        save_screenshot(page, "ERROR_login_no_continue_btn_step2")
+        raise RuntimeError("密码输入后未能找到 Continue 按钮")
+
+    log("Clicking form Continue button to sign in...")
+    continue_btn.click()
+
+    # Wait for login redirect to hokas.net (and away from /sign-in)
+    for _ in range(30):
         time.sleep(1)
-        if "/sign-in" not in page.url:
-            log(f"Login succeeded! Redirected to: {page.url}")
+        cur_url = page.url or ""
+        if "hokas.net" in cur_url and "/sign-in" not in cur_url and "/sso-callback" not in cur_url:
+            log(f"Login succeeded! Redirected to: {cur_url}")
+            time.sleep(3)
             return
 
-    # Check if still on sign-in with an error
-    raise RuntimeError(f"登录超时或失败，当前仍停留在: {page.url}")
+    save_screenshot(page, "ERROR_login_failed_or_stuck")
+    raise RuntimeError(f"登录超时或需要二次验证，当前仍停留在: {page.url}")
 
 
 def get_remaining_time(tab) -> str:
